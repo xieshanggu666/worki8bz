@@ -57,7 +57,7 @@ export const usePubStore = defineStore('pub', {
     async createImport(items, idemKey, headers) {
       return await api('/imports', 'POST', { items, idem_key: idemKey || undefined }, null, headers)
     },
-    async fetchImport(id) { return await api(`/imports/${id}`) },
+    async fetchJob(id) { return await api(`/imports/${id}`) },
     async fetchImports() { return (await api('/imports')).jobs },
     async pauseImport(id) { return await api(`/imports/${id}/pause`, 'POST') },
     async resumeImport(id) { return await api(`/imports/${id}/resume`, 'POST') },
