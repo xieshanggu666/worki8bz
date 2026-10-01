@@ -210,23 +210,23 @@ function startRunner(jobId) {
   })
 }
 
-// 启动/续跑任务（done 的任务直接返回，不重复执行；幂等键保证即使误调也不产生重复数据）
+// 启动/续跑任务（全部条目的终态任务直接返回，不重复执行；幂等键保证即使误调也不产生重复数据）
 export function resumeJob(jobId, { clearInjection = false } = {}) {
   const job = q1('SELECT * FROM import_jobs WHERE id=?', jobId)
   if (!job) return null
   if (clearInjection) { simFails.delete(jobId); simFailsAlways.delete(jobId) }
   if (FINAL_STATUSES.includes(job.status)) {
-    // 已结束但仍有失败条目 → 重置为 pending 续跑；全部成功则原样返回
-    const failed = q1("SELECT COUNT(*) c FROM import_job_items WHERE job_id=? AND status='failed'", jobId).c
-    if (!failed) return job
+    // 已结束但仍有未完成条目 → 继续：failed 条目（达到单条重试上限）重置为 pending 续跑；
+    // pending 条目来自块级异常整块回滚（任务 failed 但无 failed 条目），同样需要续跑，不能漏判。
+    const left = q1(`SELECT COALESCE(SUM(CASE WHEN status IN ('failed','pending') THEN 1 ELSE 0 END),0) c
+      FROM import_job_items WHERE job_id=?`, jobId).c
+    if (!left) return job // 全部成功：原样返回，不重复执行
     run("UPDATE import_job_items SET status='pending', error='' WHERE job_id=? AND status='failed'", jobId)
   }
   const state = runners.get(jobId)
   if (state) state.paused = false // 暂停中显式续跑
   // 显式置 running：既让前端立即感知，也作为旧 runner 退出时的重启信号（竞态兜底）
-  if (!FINAL_STATUSES.includes((q1('SELECT status s FROM import_jobs WHERE id=?', jobId) || {}).s)) {
-    run("UPDATE import_jobs SET status='running', last_error='', updated=? WHERE id=?", now(), jobId)
-  }
+  run("UPDATE import_jobs SET status='running', last_error='', updated=? WHERE id=? AND status!='done'", now(), jobId)
   startRunner(jobId)
   return q1('SELECT * FROM import_jobs WHERE id=?', jobId)
 }

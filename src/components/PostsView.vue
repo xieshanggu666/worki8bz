@@ -132,9 +132,13 @@ const batchErrDetails = ref([])
 
 // 可恢复任务
 const JOB_MAX = 5000
+const POLL_INTERVAL_MS = 400
+const POLL_MAX_FAILURES = 5 // 连续失败上限：熔断并提示，避免服务不可用时前端静默空转
 const job = ref(null) // { job, items, counts, statusText }
 const jobs = ref([])
 let pollTimer = null
+let polling = false // 单次轮询在途标记：防止 tick 叠加、回写乱序
+let pollFailures = 0
 
 const batchCount = computed(() => batchText.value.split('\n').filter((l) => l.trim()).length)
 const done = computed(() => job.value && ['done', 'failed'].includes(job.value.job.status))
@@ -187,8 +191,8 @@ async function submitBatch() {
   starting.value = true
   try {
     const r = await store.createImport(items, `ui-${uuid()}`)
-    job.value = r.job
-    startPolling()
+    await refreshJob(r.jobId) // 立即同步一次（复用既有的终态/暂停任务时也能正确展示与触发全局刷新）
+    if (job.value && ['pending', 'running'].includes(job.value.job.status)) startPolling()
     if (!r.reused) batchText.value = ''
   } catch (e) {
     batchError.value = e.message
@@ -197,6 +201,7 @@ async function submitBatch() {
 }
 async function refreshJob(id) {
   job.value = await store.fetchJob(id)
+  pollFailures = 0 // 成功响应即重置连续失败计数
   if (done.value) {
     stopPolling()
     await store.load() // 统计/预警/危机闭环刷新
@@ -213,31 +218,66 @@ async function openJob(id) {
   if (job.value.job.status === 'running') startPolling() // 仅进行中任务持续跟踪
 }
 async function pauseJob() {
-  await store.pauseImport(job.value.job.id)
-  stopPolling()
-  await refreshJob(job.value.job.id)
+  try {
+    await store.pauseImport(job.value.job.id)
+    stopPolling()
+    await refreshJob(job.value.job.id)
+  } catch (e) {
+    store.msg(`暂停失败：${e.message}。可重试或稍后刷新任务状态`, 'warn')
+    ensurePolling() // 操作未生效时恢复跟踪，避免界面停在旧状态
+  }
 }
 async function resumeJob() {
-  await store.resumeImport(job.value.job.id)
-  await refreshJob(job.value.job.id)
-  startPolling()
+  try {
+    await store.resumeImport(job.value.job.id)
+    await refreshJob(job.value.job.id)
+    startPolling()
+  } catch (e) {
+    store.msg(`续跑失败：${e.message}。可重试，任务进度不丢`, 'warn')
+  }
 }
 async function retryJob() {
   batchError.value = ''
-  await store.resumeImport(job.value.job.id) // failed 条目由后端重置后续跑
-  await refreshJob(job.value.job.id)
-  startPolling()
+  try {
+    await store.resumeImport(job.value.job.id) // failed 条目由后端重置后续跑
+    await refreshJob(job.value.job.id)
+    startPolling()
+  } catch (e) {
+    batchError.value = `重试失败：${e.message}`
+  }
 }
 function startPolling() {
   stopPolling()
-  pollTimer = setInterval(async () => {
-    if (!job.value) return stopPolling()
-    const st = job.value.job.status
-    if (['done', 'failed', 'paused'].includes(st)) return stopPolling() // 暂停/终态无需再轮询
-    try { await refreshJob(job.value.job.id) } catch { /* 轮询偶发失败忽略，下轮继续 */ }
-  }, 400)
+  polling = false
+  pollFailures = 0
+  pollTimer = setInterval(pollTick, POLL_INTERVAL_MS)
 }
-function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } }
+// 恢复跟踪（若已有轮询则保持）：供操作失败后兜底，确保任务仍被持续刷新
+function ensurePolling() {
+  if (!job.value || pollTimer) return
+  const st = job.value.job.status
+  if (!['done', 'failed', 'paused'].includes(st)) startPolling()
+}
+async function pollTick() {
+  if (!job.value) return stopPolling()
+  const st = job.value.job.status
+  if (['done', 'failed', 'paused'].includes(st)) return stopPolling() // 暂停/终态无需再轮询
+  if (polling) return // 上一轮请求未返回：跳过本轮，防止叠加与乱序回写
+  polling = true
+  try {
+    await refreshJob(job.value.job.id)
+  } catch (e) {
+    pollFailures += 1
+    if (pollFailures >= POLL_MAX_FAILURES) {
+      // 熔断：停止空转并明确提示，前端不再静默卡住；恢复操作或刷新任务可重新跟踪
+      stopPolling()
+      store.msg(`任务 #${job.value.job.id} 状态刷新连续失败（${pollFailures} 次）：${e.message}。请检查服务后重试`, 'warn')
+    }
+  } finally {
+    polling = false
+  }
+}
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } polling = false }
 async function loadJobs() { jobs.value = await store.fetchImports() }
 async function toggleBatch() {
   showBatch.value = !showBatch.value
